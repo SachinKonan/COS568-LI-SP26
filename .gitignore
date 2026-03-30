@@ -14,10 +14,6 @@ rmi.tar.zst
 .vscode/
 benchmark_results_*
 fb*.csv
-results/
-
-analysis_results/
-*.png
 
 # SLURM job outputs
 *.out
