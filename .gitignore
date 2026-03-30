@@ -18,3 +18,7 @@ results/
 
 analysis_results/
 *.png
+
+# SLURM job outputs
+*.out
+*.err
