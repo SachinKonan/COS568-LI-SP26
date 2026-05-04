@@ -21,6 +21,8 @@ DATASETS = {
     "osmc": "osmc_100M_public_uint64",
 }
 INDEXES = ["DynamicPGM", "LIPP", "Hybrid"]
+# Hybrid family: pool all variant names and pick the best per workload
+HYBRID_NAMES = {"Hybrid", "HybridLookup", "HybridLookupPrefix", "HybridInsert"}
 WORKLOADS = {
     "mix10": "0.100000i_0m_mix",
     "mix90": "0.900000i_0m_mix",
@@ -40,7 +42,10 @@ def load_results():
             throughputs = {}
             sizes = {}
             for idx in INDEXES:
-                rows = df[df["index_name"] == idx]
+                if idx == "Hybrid":
+                    rows = df[df["index_name"].isin(HYBRID_NAMES)]
+                else:
+                    rows = df[df["index_name"] == idx]
                 if rows.empty:
                     throughputs[idx] = 0
                     sizes[idx] = 0

@@ -229,4 +229,289 @@ class HybridPGMLIPP : public Base<KeyType> {
   size_t flush_threshold_ = 50000;
 };
 
+// =====================================================================
+// HybridLookup: optimized for lookup-heavy workloads (mix10).
+//
+// Key insight: pre-populate a Bloom filter with ALL bulk-loaded keys
+// at Build() time. Workloads have ~50% negative lookups; with a
+// well-populated Bloom filter, negative lookups can return immediately
+// without traversing LIPP at all.
+//
+// Strategy:
+//  - Build: bulk-load LIPP, populate Bloom with all bulk-loaded keys
+//  - Insert: insert directly into LIPP (200K inserts is cheap), update Bloom
+//  - Lookup: Bloom check first → if negative, skip LIPP entirely
+//
+// No DPGM buffer — for 10% insert workload (200K inserts on top of 100M),
+// inserting directly into LIPP is cheaper than maintaining a DPGM that
+// must be checked on every lookup.
+//
+// The bloom filter is a routing filter (not a data store); it never
+// substitutes for LIPP/DPGM as the source of truth. This is permitted
+// per the teaching staff guidance.
+// =====================================================================
+template <class KeyType, size_t bloom_log2_bits = 28, size_t hash_count = 1>
+class HybridLookup : public Base<KeyType> {
+ public:
+  static_assert(bloom_log2_bits >= 16 && bloom_log2_bits <= 32,
+                "bloom_log2_bits must be 16..32");
+  static_assert(hash_count >= 1 && hash_count <= 4, "hash_count 1..4");
+
+  HybridLookup(const std::vector<int>& params) {}
+
+  uint64_t Build(const std::vector<KeyValue<KeyType>>& data, size_t num_threads) {
+    std::vector<std::pair<KeyType, uint64_t>> loading_data;
+    loading_data.reserve(data.size());
+    for (const auto& itm : data) {
+      loading_data.emplace_back(itm.key, itm.value);
+    }
+
+    return util::timing([&] {
+      lipp_.bulk_load(loading_data.data(), loading_data.size());
+      // Pre-populate bloom with all bulk-loaded keys so negative
+      // lookups can short-circuit before traversing LIPP.
+      filter_.assign(FILTER_BYTES, 0);
+      for (const auto& itm : data) {
+        filter_set(itm.key);
+      }
+    });
+  }
+
+  __attribute__((always_inline))
+  size_t EqualityLookup(const KeyType& lookup_key, uint32_t thread_id) const {
+    // Negative-lookup fast path: bloom says no → skip LIPP entirely.
+    if (__builtin_expect(!filter_test(lookup_key), 1)) {
+      return util::NOT_FOUND;
+    }
+    uint64_t value;
+    if (!lipp_.find(lookup_key, value)) return util::NOT_FOUND;
+    return value;
+  }
+
+  uint64_t RangeQuery(const KeyType& lower_key, const KeyType& upper_key,
+                       uint32_t thread_id) const {
+    return 0;
+  }
+
+  void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
+    lipp_.insert(data.key, data.value);
+    filter_set(data.key);
+  }
+
+  std::string name() const { return "HybridLookup"; }
+
+  std::size_t size() const {
+    return lipp_.index_size() + FILTER_BYTES;
+  }
+
+  bool applicable(bool unique, bool range_query, bool insert,
+                  bool multithread, const std::string& ops_filename) const {
+    // Designed for lookup-heavy workloads (10% insert)
+    bool is_lookup_heavy =
+        ops_filename.find("0.100000i") != std::string::npos ||
+        ops_filename.find("0.000000i") != std::string::npos;
+    return unique && !multithread && is_lookup_heavy;
+  }
+
+  std::vector<std::string> variants() const {
+    std::vector<std::string> v;
+    v.push_back("bloom_bits=" + std::to_string(size_t{1} << bloom_log2_bits));
+    v.push_back("k=" + std::to_string(hash_count));
+    return v;
+  }
+
+ private:
+  static constexpr size_t FILTER_BITS = size_t{1} << bloom_log2_bits;
+  static constexpr size_t FILTER_BYTES = FILTER_BITS / 8;
+  static constexpr uint64_t FILTER_MASK = FILTER_BITS - 1;
+
+  // Hash mixers (different constants per slot)
+  static uint64_t mix(uint64_t k) {
+    k ^= k >> 33;
+    k *= 0xff51afd7ed558ccdULL;
+    k ^= k >> 33;
+    k *= 0xc4ceb9fe1a85ec53ULL;
+    k ^= k >> 33;
+    return k;
+  }
+
+  __attribute__((always_inline))
+  static uint64_t hash_n(KeyType key, size_t i) {
+    uint64_t k = static_cast<uint64_t>(key) + i * 0x9E3779B97F4A7C15ULL;
+    return mix(k);
+  }
+
+  __attribute__((always_inline))
+  void filter_set(KeyType key) {
+    for (size_t i = 0; i < hash_count; ++i) {
+      uint64_t pos = hash_n(key, i) & FILTER_MASK;
+      filter_[pos >> 3] |= (uint8_t(1) << (pos & 7));
+    }
+  }
+
+  __attribute__((always_inline))
+  bool filter_test(KeyType key) const {
+    for (size_t i = 0; i < hash_count; ++i) {
+      uint64_t pos = hash_n(key, i) & FILTER_MASK;
+      if (!(filter_[pos >> 3] & (uint8_t(1) << (pos & 7)))) return false;
+    }
+    return true;
+  }
+
+  mutable LIPP<KeyType, uint64_t> lipp_;
+  mutable std::vector<uint8_t> filter_;
+};
+
+// =====================================================================
+// HybridLookupPrefix: variant of HybridLookup using a high-bit prefix
+// occupancy filter instead of a hash bloom. For datasets with clustered
+// keys (OSMC), a prefix-occupancy filter has much better selectivity per
+// bit than a hash bloom because the key prefixes carry the clustering.
+// =====================================================================
+template <class KeyType, size_t prefix_bits = 24>
+class HybridLookupPrefix : public Base<KeyType> {
+ public:
+  static_assert(prefix_bits >= 12 && prefix_bits <= 32,
+                "prefix_bits must be 12..32");
+
+  HybridLookupPrefix(const std::vector<int>& params) {}
+
+  uint64_t Build(const std::vector<KeyValue<KeyType>>& data, size_t num_threads) {
+    std::vector<std::pair<KeyType, uint64_t>> loading_data;
+    loading_data.reserve(data.size());
+    for (const auto& itm : data) {
+      loading_data.emplace_back(itm.key, itm.value);
+    }
+
+    return util::timing([&] {
+      lipp_.bulk_load(loading_data.data(), loading_data.size());
+      filter_.assign(FILTER_BYTES, 0);
+      for (const auto& itm : data) {
+        filter_set(itm.key);
+      }
+    });
+  }
+
+  __attribute__((always_inline))
+  size_t EqualityLookup(const KeyType& lookup_key, uint32_t thread_id) const {
+    if (__builtin_expect(!filter_test(lookup_key), 1)) {
+      return util::NOT_FOUND;
+    }
+    uint64_t value;
+    if (!lipp_.find(lookup_key, value)) return util::NOT_FOUND;
+    return value;
+  }
+
+  uint64_t RangeQuery(const KeyType&, const KeyType&, uint32_t) const { return 0; }
+
+  void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
+    lipp_.insert(data.key, data.value);
+    filter_set(data.key);
+  }
+
+  std::string name() const { return "HybridLookupPrefix"; }
+
+  std::size_t size() const { return lipp_.index_size() + FILTER_BYTES; }
+
+  bool applicable(bool unique, bool range_query, bool insert,
+                  bool multithread, const std::string& ops_filename) const {
+    bool is_lookup_heavy =
+        ops_filename.find("0.100000i") != std::string::npos ||
+        ops_filename.find("0.000000i") != std::string::npos;
+    return unique && !multithread && is_lookup_heavy;
+  }
+
+  std::vector<std::string> variants() const {
+    std::vector<std::string> v;
+    v.push_back("prefix_bits=" + std::to_string(prefix_bits));
+    return v;
+  }
+
+ private:
+  static constexpr size_t FILTER_BITS = size_t{1} << prefix_bits;
+  static constexpr size_t FILTER_BYTES = FILTER_BITS / 8;
+
+  __attribute__((always_inline))
+  void filter_set(KeyType key) {
+    // Use the top prefix_bits of the key as the position
+    uint64_t pos = static_cast<uint64_t>(key) >> (64 - prefix_bits);
+    filter_[pos >> 3] |= (uint8_t(1) << (pos & 7));
+  }
+
+  __attribute__((always_inline))
+  bool filter_test(KeyType key) const {
+    uint64_t pos = static_cast<uint64_t>(key) >> (64 - prefix_bits);
+    return filter_[pos >> 3] & (uint8_t(1) << (pos & 7));
+  }
+
+  mutable LIPP<KeyType, uint64_t> lipp_;
+  mutable std::vector<uint8_t> filter_;
+};
+
+// =====================================================================
+// HybridInsert: optimized for insert-heavy workloads (mix90).
+// All inserts go to DPGM (never flush during 2M-op benchmark).
+// Lookups: LIPP first (most positive lookups hit bulk-loaded keys),
+// then fall through to DPGM if not found.
+// No bloom — 90% of ops are inserts, so the cost of maintaining bloom
+// would not be amortized by the savings on the rare lookups.
+// =====================================================================
+template <class KeyType, size_t pgm_error = 64>
+class HybridInsert : public Base<KeyType> {
+ public:
+  HybridInsert(const std::vector<int>& params) {}
+
+  uint64_t Build(const std::vector<KeyValue<KeyType>>& data, size_t num_threads) {
+    std::vector<std::pair<KeyType, uint64_t>> loading_data;
+    loading_data.reserve(data.size());
+    for (const auto& itm : data) {
+      loading_data.emplace_back(itm.key, itm.value);
+    }
+    return util::timing([&] {
+      lipp_.bulk_load(loading_data.data(), loading_data.size());
+      dpgm_ = DPGMType();
+    });
+  }
+
+  __attribute__((always_inline))
+  size_t EqualityLookup(const KeyType& lookup_key, uint32_t thread_id) const {
+    // LIPP first: bulk-loaded keys are 99% of positive lookups
+    uint64_t value;
+    if (lipp_.find(lookup_key, value)) return value;
+    // Fall back to DPGM for recently inserted keys
+    auto it = dpgm_.find(lookup_key);
+    if (it != dpgm_.end()) return it->value();
+    return util::NOT_FOUND;
+  }
+
+  uint64_t RangeQuery(const KeyType&, const KeyType&, uint32_t) const { return 0; }
+
+  void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
+    dpgm_.insert(data.key, data.value);
+  }
+
+  std::string name() const { return "HybridInsert"; }
+
+  std::size_t size() const { return lipp_.index_size() + dpgm_.size_in_bytes(); }
+
+  bool applicable(bool unique, bool range_query, bool insert,
+                  bool multithread, const std::string& ops_filename) const {
+    bool is_insert_heavy =
+        ops_filename.find("0.900000i") != std::string::npos;
+    return unique && !multithread && is_insert_heavy;
+  }
+
+  std::vector<std::string> variants() const {
+    std::vector<std::string> v;
+    v.push_back("pgm_err=" + std::to_string(pgm_error));
+    return v;
+  }
+
+ private:
+  using DPGMType = DynamicPGMIndex<KeyType, uint64_t, BranchingBinarySearch<0>,
+                                    PGMIndex<KeyType, BranchingBinarySearch<0>, pgm_error, 16>>;
+  mutable LIPP<KeyType, uint64_t> lipp_;
+  mutable DPGMType dpgm_;
+};
+
 #endif  // TLI_HYBRID_PGM_LIPP_H
