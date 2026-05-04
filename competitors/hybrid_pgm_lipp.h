@@ -253,8 +253,8 @@ class HybridPGMLIPP : public Base<KeyType> {
 template <class KeyType, size_t bloom_log2_bits = 28, size_t hash_count = 1>
 class HybridLookup : public Base<KeyType> {
  public:
-  static_assert(bloom_log2_bits >= 16 && bloom_log2_bits <= 32,
-                "bloom_log2_bits must be 16..32");
+  static_assert(bloom_log2_bits >= 16 && bloom_log2_bits <= 36,
+                "bloom_log2_bits must be 16..36");
   static_assert(hash_count >= 1 && hash_count <= 4, "hash_count 1..4");
 
   HybridLookup(const std::vector<int>& params) {}
@@ -371,8 +371,8 @@ class HybridLookup : public Base<KeyType> {
 template <class KeyType, size_t prefix_bits = 24>
 class HybridLookupPrefix : public Base<KeyType> {
  public:
-  static_assert(prefix_bits >= 12 && prefix_bits <= 32,
-                "prefix_bits must be 12..32");
+  static_assert(prefix_bits >= 12 && prefix_bits <= 36,
+                "prefix_bits must be 12..36");
 
   HybridLookupPrefix(const std::vector<int>& params) {}
 
